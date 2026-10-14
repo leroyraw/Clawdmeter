@@ -1,0 +1,3 @@
+# macOS/Linux daemon dependency manifest.
+# WiFi transport (HTTP delivery to the board) — see daemon/http_delivery.py.
+aiohttp

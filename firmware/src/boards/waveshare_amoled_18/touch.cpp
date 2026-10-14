@@ -1,15 +1,26 @@
 #include "../../hal/touch_hal.h"
 #include "board.h"
 #include "board_rev.h"
+#include "io_expander.h"
 #include <Arduino.h>
 #include <Wire.h>
 
 // Minimal capacitive-touch reader. Both shipping panel revisions expose the
 // FocalTech-style touch-data layout, so one read path serves both — only the
-// I2C address differs (FT3168 @ 0x38 vs CST816 @ 0x15), chosen from board_rev().
+// I2C address differs (FT3168 @ 0x38 vs CST816/CST820 @ 0x15), chosen from
+// board_rev().
 //   reg 0x02:        low nibble = active finger count
 //   reg 0x03 / 0x04: X1 high (low nibble) + X1 low
 //   reg 0x05 / 0x06: Y1 high (low nibble) + Y1 low
+//
+// Register reads terminate the pointer-write with a STOP (endTransmission(true))
+// and then issue a fresh-START read — this matches how SensorLib drives the
+// whole CST816/CST820 family (__sendStop = true) and works on the FT3168 too.
+//
+// POWER GOTCHA (CO5300/CST820 V2 panel): the CST820 is powered through XCA9554
+// EXIO2. That same pin is the audio-amp enable on the original (SH8601) board,
+// so sound.cpp must NOT pull EXIO2 low on this revision (it does on V1). We also
+// assert EXIO2 high here so touch owns its own power rail regardless of audio.
 
 static volatile bool     touch_data_ready = false;
 static volatile bool     touch_pressed = false;
@@ -24,7 +35,7 @@ static void IRAM_ATTR touch_isr(void) {
 static void touch_read_into_shared_state(void) {
     Wire.beginTransmission(touch_addr);
     Wire.write(0x02);
-    if (Wire.endTransmission(false) != 0) { touch_pressed = false; return; }
+    if (Wire.endTransmission(true) != 0) { touch_pressed = false; return; }
     if (Wire.requestFrom(touch_addr, (uint8_t)5) != 5) { touch_pressed = false; return; }
     uint8_t fingers = Wire.read() & 0x0F;
     uint8_t xH = Wire.read();
@@ -44,6 +55,15 @@ void touch_hal_init(void) {
     bool is_cst816 = (board_rev() == REV_CO5300_CST816);
     touch_addr = is_cst816 ? CST816_ADDR : FT3168_ADDR;
 
+    if (is_cst816) {
+        // The CST820's power rail is gated by XCA9554 EXIO2. sound_hal_init()
+        // may have driven it low (it's the amp-enable line on the V1 board), so
+        // bring it back high and give the controller time to boot before we
+        // probe it. Without this the chip never ACKs and touch is dead.
+        io_expander_set(IOX_PIN_PA_EN, true);
+        delay(60);
+    }
+
     if (!is_cst816) {
         // FT3168 power-mode register 0xA5 = 0x00: active scanning.
         // (CST816 reports by default; no equivalent setup needed.)
@@ -53,11 +73,12 @@ void touch_hal_init(void) {
         Wire.endTransmission();
     }
 
-    // Verify the controller answers. FT3168 chip-id is reg 0xA0; CST816 reg 0xA7.
+    // Verify the controller answers. FT3168 chip-id is reg 0xA0; CST816 reg 0xA7
+    // (CST816S=0xB4, CST816T=0xB5, CST816D=0xB6, CST820=0xB7).
     uint8_t id_reg = is_cst816 ? 0xA7 : 0xA0;
     Wire.beginTransmission(touch_addr);
     Wire.write(id_reg);
-    if (Wire.endTransmission(false) == 0 && Wire.requestFrom(touch_addr, (uint8_t)1) == 1) {
+    if (Wire.endTransmission(true) == 0 && Wire.requestFrom(touch_addr, (uint8_t)1) == 1) {
         Serial.printf("Touch %s ID=0x%02X (addr 0x%02X)\n",
                       is_cst816 ? "CST816" : "FT3168", Wire.read(), touch_addr);
     } else {

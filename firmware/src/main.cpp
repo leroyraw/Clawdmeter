@@ -1,25 +1,17 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <lvgl.h>
-#include <ArduinoJson.h>
 #include <esp_heap_caps.h>
 
 #include "data.h"
 #include "ui.h"
-#include "ble.h"
+#include "net.h"
+#include "claude_poll.h"
+#include "wifi_creds.h"
 #include "splash.h"
-#include "mascot.h"
-#include "clawd_director.h"
-#include "usage_rate.h"
-#include "signals.h"
-#include "payload.h"
-#include "minimal_mode.h"
-#include "build_info.h"
 #include "idle.h"
 #include "idle_cfg.h"
 #include "brightness.h"
-#include "perf.h"
-#include "pair_hold.h"
 
 #include "hal/board_caps.h"
 #include "hal/display_hal.h"
@@ -28,9 +20,6 @@
 #include "hal/power_hal.h"
 #include "hal/imu_hal.h"
 #include "hal/sound_hal.h"
-#include "hal/board_info_hal.h"
-
-static UsageData usage = {};
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -65,12 +54,8 @@ static void rounder_cb(lv_event_t* e) {
 //           swallowed (mirrors the button wake-consumption); a press while
 //           awake counts as activity.
 //   false → touch never counts as activity and is fully swallowed while the
-//           panel is dark, so pets/sleeves can't wake it overnight and the
-//           director can't act on taps nobody can see.
-// A finger is on the panel (after the wake filter below); read by the
-// touch-hold re-pair on boards without a PWR button.
-static bool touch_down = false;
-
+//           panel is dark, so pets/sleeves can't wake it overnight and LVGL
+//           can't quietly toggle splash<->usage on a black panel.
 static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     uint16_t x, y;
     bool pressed;
@@ -101,7 +86,6 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
         pressed = false;
     }
 
-    touch_down = pressed;
     if (pressed) {
         data->point.x = x;
         data->point.y = y;
@@ -109,26 +93,6 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
     }
-}
-
-// Parse a JSON line into UsageData (payload.cpp holds the pure parser).
-static bool parse_json(const char* json, UsageData* out) {
-    const char* err = nullptr;
-    if (!payload_parse(json, out, &err)) {
-        Serial.printf("JSON parse error: %s\n", err ? err : "?");
-        return false;
-    }
-    return true;
-}
-
-// Forget every bonded host and advertise again, so another computer (or
-// this one, after removing the device) can pair. The PWR hold gesture, the
-// touch hold on boards without PWR, and the `unpair` serial command all end
-// here.
-static void clear_pairing(const char* why) {
-    Serial.printf("Pair: clearing bonds (%s), advertising\n", why);
-    ble_clear_bonds();
-    ui_set_pair_hint(PAIR_HINT_CLEARED);
 }
 
 // ---- Serial command buffer ----
@@ -174,44 +138,13 @@ static void send_screenshot() {
 #endif
 }
 
-// One JSON line identifying this build, for the desktop flasher's first
-// detection probe. Keys are fixed: env, ver, rev, link.
-static void send_info() {
-    Serial.printf("{\"env\":\"%s\",\"ver\":\"%s\",\"rev\":\"%s\",\"link\":\"ble\"}\n",
-                  CLAWD_ENV, CLAWD_VERSION, board_hal_rev());
-}
-
 static void check_serial_cmd() {
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '\n' || c == '\r') {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
-            else if (strcmp(cmd_buf, "chime") == 0 || strcmp(cmd_buf, "buzz") == 0) sound_hal_chime();
-            else if (strncmp(cmd_buf, "chime ", 6) == 0) {
-                // Dev tool for tuning a board's speaker: `chime <gain> [volume]`,
-                // e.g. `chime 0.6 70` (until reboot).
-                float g = 0;
-                int v = -1;
-                if (sscanf(cmd_buf + 6, "%f %d", &g, &v) >= 1) {
-                    sound_hal_tune(g, v);
-                    Serial.printf("{\"chime\":{\"gain\":%.2f,\"volume\":%d}}\n", g, v);
-                } else {
-                    Serial.println("usage: chime [<gain 0..1> [<volume 0..100>]]");
-                }
-            }
-            else if (strcmp(cmd_buf, "info") == 0)  send_info();
-            else if (strcmp(cmd_buf, "perf") == 0)  perf_print();
-            else if (strcmp(cmd_buf, "ble") == 0) ble_print_status();
-            else if (strcmp(cmd_buf, "disconnect") == 0) ble_disconnect_all();
-            else if (strcmp(cmd_buf, "unpair") == 0) {
-                clear_pairing("serial");
-                Serial.println("{\"unpair\":true}");
-            }
-            else if (strncmp(cmd_buf, "clawd ", 6) == 0) {
-                const bool ok = director_debug(cmd_buf + 6);
-                Serial.printf("{\"clawd\":\"%s\",\"ok\":%s}\n", cmd_buf + 6, ok ? "true" : "false");
-            }
+            else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -225,8 +158,13 @@ static void check_serial_cmd() {
 // reset line). Called exactly once at the start of setup().
 extern "C" void board_init(void);
 
+// The 60s usage poll runs a TLS handshake + JSON inside loop(); the default
+// 8 KB loop-task stack leaves little headroom for mbedTLS.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 void setup() {
     Serial.begin(115200);
+    Serial.printf("Boot: reset reason %d\n", (int)esp_reset_reason());
     delay(300);
     Serial.println("{\"ready\":true}");
 
@@ -258,254 +196,130 @@ void setup() {
     lv_display_set_buffers(disp, buf1, buf2, W * BUF_LINES * 2,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_add_event_cb(disp, rounder_cb, LV_EVENT_INVALIDATE_AREA, NULL);
-    perf_attach(disp, LV_DEF_REFR_PERIOD);
 
     lv_indev_t* indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touch_cb);
 
-    ble_init();
+    // ui_init() must run before net_init(): net_init() paints the WiFi
+    // setup/connecting hint onto the panel (via ui_update_net_status +
+    // lv_timer_handler pumping — see pump_ui() in net.cpp) while blocked
+    // on the captive portal or the WiFi-connect wait, and it needs the
+    // LVGL widgets built to do that instead of leaving the panel black.
+    ui_init();
+
+    // Blocks until connected to WiFi (or falls into the captive-portal
+    // provisioning loop, which never returns until creds are saved + the
+    // device reboots). net_init()/provisioning_run() pump lv_timer_handler()
+    // during that block so the setup/connecting screen stays live.
+    net_init();
     input_hal_init();
 
-    ui_init();
-    ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
-    ui_update_battery(power_hal_battery_pct(), power_hal_is_charging(), power_hal_is_vbus_in());
-    director_init();    // rooms + beats; boots on the meters (home)
+    ui_update_net_status(net_state(), net_ip());
+    ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
+    ui_show_screen(SCREEN_SPLASH);
 
-    Serial.printf("Dashboard ready (%s, %dx%d) %lu ms after boot, waiting for data on BLE...\n",
-        board_caps().name, W, H, (unsigned long)millis());
+    Serial.printf("Dashboard ready (%s, %dx%d), waiting for data over WiFi...\n",
+        board_caps().name, W, H);
 }
 
-static ble_state_t last_ble_state = BLE_STATE_INIT;
-static int shown_group = 0;   // mood group last logged
-
-// Hold-to-pair gesture: hold the PWR button ~3s, then RELEASE → clear all BLE
-// bonds and re-advertise. Clearing on *release* (not while held) is deliberate:
-// holding to power the device OFF (AXP hardware shutdown at 8s) must not wipe
-// the bond — a power-off hold never releases before shutdown. To stop a
-// "chicken-out" release just before 8s from pairing, the gesture disarms at 6s.
-//
-//   ~1.5s long-press edge → PENDING
-//   3.0s (+1500)          → ARMED   (release from here clears bonds)
-//   6.0s (+4500)          → DISARMED (no clear; AXP powers off at 8s)
-#define PAIR_ARM_AFTER_LONG_MS    1500   // 3.0s total
-#define PAIR_DISARM_AFTER_LONG_MS 4500   // 6.0s total
-enum pair_state_t { PAIR_IDLE, PAIR_PENDING, PAIR_ARMED };
-static pair_state_t pair_state        = PAIR_IDLE;
-static uint32_t     pair_long_seen_ms = 0;
-
-static void pair_tick(void) {
-    if (pair_state == PAIR_IDLE && power_hal_pwr_long_pressed()) {
-        pair_state = PAIR_PENDING;
-        pair_long_seen_ms = millis();
-        (void)power_hal_pwr_released();  // drain any stale release edge
-        Serial.println("PWR long-press: hold to ~3s then release to pair");
-        return;
-    }
-    if (pair_state == PAIR_IDLE) return;
-
-    if (power_hal_pwr_released()) {
-        if (pair_state == PAIR_ARMED) {
-            clear_pairing("PWR hold");
-        } else {
-            Serial.println("Pair: released too early — cancelled");
-        }
-        pair_state = PAIR_IDLE;
-        return;
-    }
-
-    uint32_t held = millis() - pair_long_seen_ms;
-    if (pair_state == PAIR_PENDING && held >= PAIR_ARM_AFTER_LONG_MS) {
-        pair_state = PAIR_ARMED;
-        Serial.println("Pair: armed — release to pair");
-    } else if (pair_state == PAIR_ARMED && held >= PAIR_DISARM_AFTER_LONG_MS) {
-        pair_state = PAIR_IDLE;  // power-off territory; don't pair
-        Serial.println("Pair: disarmed (holding toward power-off)");
-    }
-}
-
-// Boards without a PWR button: a 5 s touch hold on the pairing hint clears
-// the bonds (pair_hold.h). Only counts while the hint is what you see.
-static PairHold touch_hold = { PAIR_HOLD_UP, false, 0 };
-
-static void touch_pair_tick(void) {
-    if (board_caps().has_pwr_button) return;
-    // Taps on the hint don't make Clawd peek (the face would cover it).
-    director_set_pairing_touch(ui_pair_hint_visible());
-    const bool enabled = ui_pair_hint_visible() && director_room() == ROOM_METERS && !idle_is_asleep();
-    switch (pair_hold_step(&touch_hold, enabled, touch_down, millis())) {
-    case PAIR_HOLD_HOLDING:
-        Serial.println("Pair: touch hold, keep holding to clear the pairing");
-        ui_set_pair_hint(PAIR_HINT_HOLDING);
-        break;
-    case PAIR_HOLD_CANCEL:
-        Serial.println("Pair: touch hold released early, cancelled");
-        ui_set_pair_hint(PAIR_HINT_NORMAL);
-        break;
-    case PAIR_HOLD_FIRE:
-        clear_pairing("touch hold");
-        break;
-    case PAIR_HOLD_NONE:
-        break;
-    }
-}
+static NetState last_net = (NetState)-1;
 
 void loop() {
     idle_tick();
     lv_timer_handler();
     ui_tick_anim();
-    ble_tick();
+    net_tick();
     power_hal_tick();
     imu_hal_tick();
     sound_hal_tick();
     splash_tick();
-    mascot_tick();
-    director_tick();
-    if (director_take_dismissed()) ble_send_dismiss();
     // Rotation transition (blank + ramp) would fight the idle fade — skip
     // ticks while the panel is dark. A rotation that happens during sleep
     // is detected by the next tick after wake and ramped in then.
     if (!idle_is_asleep()) display_hal_tick();
 
     // ---- Physical buttons ----
-    //   PRIMARY   → HID Space  (Claude Code voice-mode PTT)
-    //   SECONDARY → HID Shift+Tab  (mode toggle; only if the board has one)
-    //   PWR       → on the stage: next scene in the group; elsewhere: cycle
-    //               brightness; hold ~3s + release: pairing mode
-    // Any press also tells the director you're here (wakes the screensaver).
+    //   PRIMARY   → wake only; held ~3s → wipe WiFi creds and re-provision
+    //   SECONDARY → (unused; was HID mode-toggle, dropped with BLE)
+    //   PWR       → on splash: cycle animations; on usage: cycle brightness
     // First press from sleep is consumed as a wake-only event by
-    // idle_consume_wake_press(); the normal action fires from the second
-    // press. Activity bookkeeping happens inside idle_consume_wake_press
-    // so no separate idle_note_activity() call is needed here.
+    // idle_consume_wake_press(); activity bookkeeping happens inside it so
+    // no separate idle_note_activity() call is needed here.
     {
         static bool primary_was = false;
-        static bool primary_wake_swallowed = false;
         bool primary_now = input_hal_is_held(INPUT_BTN_PRIMARY);
         if (primary_now != primary_was) {
-            if (primary_now) {
-                if (idle_consume_wake_press()) primary_wake_swallowed = true;
-                else { ble_keyboard_press(0x2C, 0); director_button(); }  // HID Space, no mods
-            } else {
-                if (primary_wake_swallowed) primary_wake_swallowed = false;
-                else                        ble_keyboard_release();
-            }
+            if (primary_now) idle_consume_wake_press();
             primary_was = primary_now;
         }
 
-        if (board_caps().button_count >= 2) {
-            static bool secondary_was = false;
-            static bool secondary_wake_swallowed = false;
-            bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
-            if (secondary_now != secondary_was) {
-                if (secondary_now) {
-                    if (idle_consume_wake_press()) secondary_wake_swallowed = true;
-                    else { ble_keyboard_press(0x2B, 0x02); director_button(); }  // HID Tab + LEFT_SHIFT
-                } else {
-                    if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
-                }
-                secondary_was = secondary_now;
-            }
+        // BOOT held ~3s → wipe WiFi creds and reboot into the captive portal.
+        static uint32_t primary_down_ms = 0;
+        if (primary_now && primary_down_ms == 0) primary_down_ms = millis();
+        if (!primary_now) primary_down_ms = 0;
+        if (primary_down_ms && millis() - primary_down_ms > 3000) {
+            Serial.println("BOOT long-press: clearing WiFi creds, re-provisioning");
+            wifi_creds_clear();
+            ESP.restart();
         }
 
         if (power_hal_pwr_pressed()) {
             if (!idle_consume_wake_press()) {
-                // On the stage PWR swaps the scene and stays in the room (a
-                // screensaver calm dip steps to the other calm scene);
-                // anywhere else it cycles brightness and counts as you being here.
-                if (director_room() == ROOM_STAGE) director_stage_next();
-                else { brightness_cycle(); director_button(); }
+                // On splash: cycle animations. On the usage view: cycle
+                // screen brightness (single non-splash view, no more screens).
+                if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
+                else                                          brightness_cycle();
             }
         }
-
-        pair_tick();
-        touch_pair_tick();
     }
 
-    ble_state_t bs = ble_get_state();
-    if (bs != last_ble_state) {
-        last_ble_state = bs;
-        ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
+    NetState ns = net_state();
+    if (ns != last_net) {
+        last_net = ns;
+        ui_update_net_status(ns, net_ip());
+    }
+
+    // On-device usage poll (replaces the host daemon's /usage POST once
+    // logged in): once every 60s while online + logged in, plus immediately
+    // on first entering that state. claude_poll() blocks ~1-3s on HTTPS —
+    // an acceptable once-a-minute stall for a single-purpose display.
+    // A failed poll retries after 10s instead of a full minute, so a
+    // transient error right after boot doesn't leave the screen empty.
+    {
+        static uint32_t last_poll = 0;
+        static uint32_t poll_interval = 60000;
+        static bool     polled_since_ok = false;
+        if (ns == NET_ONLINE_OK) {
+            if (!polled_since_ok || millis() - last_poll >= poll_interval) {
+                last_poll = millis();
+                polled_since_ok = true;
+                UsageData u{};
+                bool ok = claude_poll(u);
+                if (ok) apply_usage(u);
+                else    Serial.println("usage poll failed, retrying in 10s");
+                poll_interval = ok ? 60000 : 10000;
+            }
+        } else {
+            polled_since_ok = false;
+        }
     }
 
     static int  last_pct      = -2;
     static bool last_charging = false;
-    static bool last_vbus     = false;
     int  pct      = power_hal_battery_pct();
     bool charging = power_hal_is_charging();
-    bool vbus     = power_hal_is_vbus_in();
-    if (pct != last_pct || charging != last_charging || vbus != last_vbus) {
-        if (pct != last_pct) ble_set_battery_level(pct);
+    if (pct != last_pct || charging != last_charging) {
         last_pct = pct;
         last_charging = charging;
-        last_vbus = vbus;
-        ui_update_battery(pct, charging, vbus);
+        ui_update_battery(pct, charging);
     }
 
     check_serial_cmd();
 
-    if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
-            // Fast + slow clock bookkeeping: rate sample (replays skipped),
-            // hook activity lift, event dedupe. See signals.h.
-            const SignalsUpdate sig = signals_ingest(&usage);
-            const bool session_reset = sig.session_reset;
-            const int g_before = sig.group_before;
-            const int g_after  = sig.group_after;
-            shown_group = g_after;
-            if (sig.event_fired)
-                Serial.printf("[%lu] hook event '%c' (#%lu)\n", (unsigned long)millis(),
-                              sig.event ? sig.event : '?', (unsigned long)sig.event_seq);
-            // 5-hour session limit refilled → ding so the user knows they can
-            // use Claude again (no-op on boards without sound). Gated on the
-            // app's opt-in `c` (reset_chime); the `chime` serial cmd ignores it.
-            if (session_reset && usage.chime) {
-                Serial.println("session reset detected — chime");
-                sound_hal_chime();
-            }
-            // Claude Code hook fired on the host: the same ding. Not gated on
-            // `c`: the app only sets `b` when its alert chime is on.
-            if (usage.beep) {
-                Serial.println("attention — chime");
-                sound_hal_chime();
-            }
-            ui_update(&usage);
-            // A prompt (or you're back after a gap): you're at the computer,
-            // so a dimmed or dark panel wakes before Clawd notices you. A
-            // Stop or tool activity doesn't: Claude working alone isn't you.
-            if (sig.event_fired && (sig.event == 'p' || sig.event == 'b'))
-                idle_note_activity();
-            director_on_payload(&usage, &sig);
-            if (usage.alert_msg[0]) {
-                Serial.println("attention — mascot");
-                idle_note_activity();
-                director_alert(usage.alert_msg);
-            }
-            if (usage.alert_clear) director_alert_clear();
-            if (g_after != g_before)
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-            ble_send_ack();
-        } else {
-            ble_send_nack();
-        }
-    }
-
-    // The mood group also moves without a payload: the 15-min window decays
-    // to Idle on its own and a hook activity lift expires. Nothing needs to
-    // react (the corner and the stage read the group when they pick), but log
-    // it so the serial trace matches what Clawd does.
-    {
-        static uint32_t last_check = 0;
-        if (millis() - last_check >= 1000) {
-            last_check = millis();
-            const int g = usage_rate_group();
-            if (g != shown_group) {
-                Serial.printf("usage rate: group %d -> %d (decay)\n", shown_group, g);
-                shown_group = g;
-            }
-        }
-    }
+    // Usage updates now arrive over the HTTP /usage POST handler in net.cpp,
+    // which parses the JSON and calls ui_update() directly (also drives the
+    // session-reset chime + splash rate-matching that used to live here).
 
     delay(5);
 }
